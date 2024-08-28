@@ -1,9 +1,12 @@
 import errno
 import os
 
-__LOCK_DIRECTORY__: str = '.locks'
-
 import time
+from typing import Callable
+
+from constants import *
+
+__LOCK_DIRECTORY__: str = '.locks'
 
 def _get_segment_lockdir(basedir: str, segment: str) -> str:
     return os.path.join(basedir, segment, __LOCK_DIRECTORY__)
@@ -24,12 +27,8 @@ def initialise_segment_locks(basedir: str, dataset_id:str, instance: str, segmen
     segment_lockpath: str = _get_segment_lockdir(dataset_base, segment)
     segment_lockfile: str = _get_segment_lockfile(dataset_base, segment)
 
-    if not os.path.exists(segment_lockfile):
-        if not os.path.exists(segment_lockpath):
-            os.makedirs(segment_lockpath)
-
-        with open(segment_lockfile, mode='a'):
-            pass
+    if not os.path.exists(segment_lockpath):
+        os.makedirs(segment_lockpath)
 
     instance_lockfile: str = _get_instance_lockfile(dataset_base, segment, instance)
     if not os.path.exists(instance_lockfile):
@@ -39,18 +38,18 @@ def initialise_segment_locks(basedir: str, dataset_id:str, instance: str, segmen
 # attempts to get an exclusive lock on the directory for the dataset and segment, it does this by
 # repeatedly attempting to create a symlink between the instance lock file and the directory lock file
 # as this is MEANT to be an atomic operation on a NFS file share
-def lock_segment(basedir: str, dataset_id: str, segment: str, instance: str, timeout: int = 300, delay: int = 5):
+def lock_segment(basedir: str, dataset_id: str, segment: str, instance: str, utc_nanos: Callable[[], int], timeout: int = 300, delay: int = 5) -> str:
     dataset_base:str = os.path.join(basedir, dataset_id)
 
     segment_lockfile: str = _get_segment_lockfile(dataset_base, segment)
     instance_lockfile: str = _get_instance_lockfile(dataset_base, segment, instance)
 
-    start = time.time()
+    start: int = utc_nanos()
 
-    while time.time() - start < timeout:
+    while (utc_nanos() - start) < (timeout * NS_PER_MINUTE):
         try:
-            os.link(instance_lockfile, segment_lockfile)
-            return
+            os.symlink(instance_lockfile, segment_lockfile)
+            return segment_lockfile
         except OSError as err:
             if err.errno == errno.EEXIST:
                 time.sleep(delay)
@@ -67,7 +66,9 @@ def unlock_segment(basedir:str, dataset_id:str,  segment: str, instance: str):
     segment_lockfile: str = _get_segment_lockfile(dataset_base, segment)
     instance_lockfile: str = _get_instance_lockfile(dataset_base, segment, instance)
 
-    if os.readlink(segment_lockfile) != instance_lockfile:
+    current_lock: str = os.readlink(segment_lockfile)
+
+    if current_lock != instance_lockfile:
         raise SegmentLockError('Cannot unlock segment, not owned by instance')
     else:
         try:
