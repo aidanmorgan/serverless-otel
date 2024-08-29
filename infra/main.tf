@@ -131,6 +131,7 @@ resource "aws_lambda_function" "serverless_otel_ingest" {
   environment {
     variables = {
       SHARED_STORAGE_BASEDIR = "/mnt/otel-hot"
+      USE_FILESYSTEM_MUTEX = "True"
     }
   }
 
@@ -152,7 +153,78 @@ resource "aws_lambda_permission" "ingest_lambda_public_access" {
   principal     = "*"
 }
 
-resource "aws_lambda_function_url" "otel-ingest-public-url" {
-  function_name      = aws_lambda_function.serverless_otel_ingest.function_name
-  authorization_type = "NONE"  # Set to "NONE" for public access
+resource "aws_api_gateway_rest_api" "ingest_lambda_rest_api" {
+  name        = "${var.prefix}-serverless-otel-ingest-api"
+  description = "API Gateway for ingest_lambda"
 }
+
+resource "aws_api_gateway_resource" "ingest_lambda_rest_api_resource" {
+  rest_api_id = aws_api_gateway_rest_api.ingest_lambda_rest_api.id
+  parent_id   = aws_api_gateway_rest_api.ingest_lambda_rest_api.root_resource_id
+  path_part   = "ingest"
+}
+
+resource "aws_api_gateway_method" "ingest_lambda_rest_api_resource_method" {
+  rest_api_id   = aws_api_gateway_rest_api.ingest_lambda_rest_api.id
+  resource_id   = aws_api_gateway_resource.ingest_lambda_rest_api_resource.id
+  http_method   = "POST"
+  authorization = "NONE"
+}
+
+resource "aws_api_gateway_integration" "ingest_lambda_rest_api_resource_integration" {
+  rest_api_id             = aws_api_gateway_rest_api.ingest_lambda_rest_api.id
+  resource_id             = aws_api_gateway_resource.ingest_lambda_rest_api_resource.id
+  http_method             = aws_api_gateway_method.ingest_lambda_rest_api_resource_method.http_method
+  uri                     = aws_lambda_function.serverless_otel_ingest.invoke_arn
+  integration_http_method = "POST"
+  type                    = "AWS"
+  request_parameters      = {
+    "integration.request.header.X-Amz-Invocation-Type" = "'Event'"
+  }
+}
+
+# Create API Gateway method response
+resource "aws_api_gateway_method_response" "ingest_lambda_rest_api_response_200" {
+  rest_api_id = aws_api_gateway_rest_api.ingest_lambda_rest_api.id
+  resource_id = aws_api_gateway_resource.ingest_lambda_rest_api_resource.id
+  http_method = aws_api_gateway_method.ingest_lambda_rest_api_resource_method.http_method
+  status_code = "200"
+}
+
+# Create API Gateway integration response
+resource "aws_api_gateway_integration_response" "ingest_lambda_rest_api_integration_response" {
+  rest_api_id = aws_api_gateway_rest_api.ingest_lambda_rest_api.id
+  resource_id = aws_api_gateway_resource.ingest_lambda_rest_api_resource.id
+  http_method = aws_api_gateway_method.ingest_lambda_rest_api_resource_method.http_method
+  status_code = aws_api_gateway_method_response.ingest_lambda_rest_api_response_200.status_code
+
+  depends_on = [
+    aws_api_gateway_integration.ingest_lambda_rest_api_resource_integration
+  ]
+}
+
+# Deploy the API Gateway
+resource "aws_api_gateway_deployment" "ingest_lambda_rest_api_deployment" {
+  rest_api_id = aws_api_gateway_rest_api.ingest_lambda_rest_api.id
+  stage_name  = "prod"
+
+  depends_on = [
+    aws_api_gateway_integration.ingest_lambda_rest_api_resource_integration
+  ]
+}
+
+# Allow API Gateway to invoke the Lambda function
+resource "aws_lambda_permission" "api_gateway_lambda" {
+  statement_id  = "AllowAPIGatewayInvoke"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.serverless_otel_ingest.function_name
+  principal     = "apigateway.amazonaws.com"
+  source_arn    = "${aws_api_gateway_rest_api.ingest_lambda_rest_api.execution_arn}/*/*"
+}
+
+
+output "api_gateway_url" {
+  value = "${aws_api_gateway_deployment.ingest_lambda_rest_api_deployment.invoke_url}${aws_api_gateway_resource.ingest_lambda_rest_api_resource.path}"
+}
+
+
