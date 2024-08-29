@@ -51,14 +51,18 @@ __REQUIRED_KEYS__: Final[List[str]] = ['timestamp-ms', 'timestamp-ns', 'correlat
 # (other than __IGNORE_KEYS__) are ignored when writing to the file system
 __ALLOWED_DATA_TYPE_SUFFIXES__: Final[List[str]] = ['.int64', '.varchar', '.float64', '.bool', '.datetime']
 
-# whether file system access should be synchronized through the NFS file system locking process or not
+# How we should be controlling access to the files - either NFS, S3 or None (default)
+# NFI what will happen if you turn them both on other than a spectacular deadlock :-|
 __USE_FILESYSTEM_MUTEX__: Final[bool] = bool(os.getenv('USE_FILESYSTEM_MUTEX', default='False'))
 __USE_S3_MUTEX__: Final[bool] = bool(os.getenv('USE_S3_MUTEX', default='False'))
 
-__USE_FILE_STORAGE__: Final[bool] = bool(os.getenv('USE_FILE_STORAGE', default='False'))
+__USE_DIRECTORY_AND_FILE_STORAGE__: Final[bool] = bool(os.getenv('USE_DIRECTORY_AND_FILE_STORAGE', default='False'))
 __USE_SQLITE_STORAGE__: Final[bool] = bool(os.getenv('USE_SQLITE_STORAGE', default='True'))
 
 def lambda_handler(event, context):
+    if __USE_S3_MUTEX__ and __USE_FILESYSTEM_MUTEX__:
+        print(f'Cant have both mutexes enabled')
+        return 500
 
     telemetry_dict: Dict[str, str] = _body_to_dict(event)
     dataset_id: str = telemetry_dict['dataset-id']
@@ -71,16 +75,16 @@ def lambda_handler(event, context):
     if __USE_SQLITE_STORAGE__:
         return _lambda_handler_sqlite(event, context, dataset_id, segment_id, telemetry_dict)
 
-    if __USE_FILE_STORAGE__:
+    if __USE_DIRECTORY_AND_FILE_STORAGE__:
         return _lambda_handler_files(event, context, dataset_id, segment_id, telemetry_dict)
 
-    return 404
+    print(f'Neither storage mechanisms are enabled.')
+    return 500
 
 def _lambda_handler_sqlite(event, context, dataset_id: str, segment_id: str, telemetry_dict: Dict[str,Any]):
     nfs_initialise_segment_locks(__STORAGE_BASE_PATH__, dataset_id, __INSTANCE_ID__, segment_id)
 
     con: Optional[Connection] = None
-
     lock: Optional[Any] = None
 
     try:
@@ -106,10 +110,10 @@ def _lambda_handler_sqlite(event, context, dataset_id: str, segment_id: str, tel
         con.commit()
     except BodyError as err:
         print(f'Invalid body content for Segment {segment_id}. {err}')
-        return 503
+        return 400
     except SegmentLockError as err:
         print(f'Error locking Segment {segment_id}. {err}')
-        return 503
+        return 500
     finally:
         try:
             if __USE_FILESYSTEM_MUTEX__:
@@ -129,6 +133,10 @@ def _lambda_handler_files(event, context, dataset_id: str, segment_id: str, tele
     nfs_initialise_segment_locks(__STORAGE_BASE_PATH__, dataset_id, __INSTANCE_ID__, segment_id)
 
     try:
+        # these are very coarse-grained locks, we're locking the whole segment (15 minutes of data) could probably be
+        # refined to actually lock the specific file we are attempting to update, and probably even run in parallel
+        # HOWEVER - this then creates a weird rollback situation if we have been able to write to some files, but not all
+        # then we have thrown away data, so leaving this as the coarse-grained lock for the time being...
         if __USE_FILESYSTEM_MUTEX__:
             nfs_lock_segment(__STORAGE_BASE_PATH__, dataset_id, segment_id, __INSTANCE_ID__, __UTC_NOW_NANOS__)
 
@@ -223,7 +231,7 @@ def _append_record(dataset_id: str, segment_id: str, timestamp: str, correlation
     line: str = __FORMAT_SEGMENT_LINE__(timestamp, correlation_id, value)
 
     with open(path, 'a') as column_file:
-        # append the value to the column file, using fixed-width values for the entries
+        # append the value to the column file
         column_file.write(f'{line}\n')
         column_file.flush()
 

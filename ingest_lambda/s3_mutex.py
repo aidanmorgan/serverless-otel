@@ -45,6 +45,9 @@ def s3_lock_segment(dataset_id: str, segment: str, instance: str, utc_nanos: Cal
 
     while (utc_nanos() - start) < (timeout * NS_PER_S):
         try:
+            # the body of the file seems stupid, however the ETag is based on these values, so by making sure we have some concept of time and the instance
+            # that is attempting to write to the object then we maybe/should/potentially can make sure that we're referring to the
+            # same lock file when we go to unlock?
             lock_id: Dict[str,Any] = __S3_CLIENT_FACTORY__().put_object(Bucket=__BUCKET_NAME__, Key=f'{dataset_id}/{segment}', Body=str.encode(f'{instance}:{time.time_ns()}'), IfNoneMatch='*', Tagging=f'instance_id={instance}', Expires=datetime.datetime.now() + datetime.timedelta(seconds=__LOCK_TTL_SECONDS__))
             return S3LockIdentifier(ETag=lock_id['ETag'].strip('"'), Timestamp=utc_nanos())
         except ClientError as err:
@@ -57,6 +60,8 @@ def s3_lock_segment(dataset_id: str, segment: str, instance: str, utc_nanos: Cal
     raise SegmentLockError(f'Cannot acquire lock, timeout after {timeout} seconds. {segment}')
 
 def s3_unlock_segment(dataset_id: str, segment: str, instance: str, lock: S3LockIdentifier) -> None:
+    # this would be easier if the ETag calculation doesn't magically change on the AWS side, because we could just
+    # compute the ETag value and not need to pass around the lock object, but /shrug
     if lock is None:
         raise SegmentUnlockError('Cannot release lock, no lock obtained.')
     try:
@@ -64,7 +69,6 @@ def s3_unlock_segment(dataset_id: str, segment: str, instance: str, lock: S3Lock
 
         if head is None:
             raise SegmentUnlockError('Cannot release lock, not owner')
-
     except ClientError as err:
         raise SegmentUnlockError('Cannot release lock, not owner')
 
