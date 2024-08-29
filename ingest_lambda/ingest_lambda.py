@@ -59,15 +59,14 @@ __USE_FILE_STORAGE__: Final[bool] = bool(os.getenv('USE_FILE_STORAGE', default='
 __USE_SQLITE_STORAGE__: Final[bool] = bool(os.getenv('USE_SQLITE_STORAGE', default='True'))
 
 def lambda_handler(event, context):
-    start_time: int = __UTC_NOW_NANOS__()
+
+    telemetry_dict: Dict[str, str] = _body_to_dict(event)
+    dataset_id: str = telemetry_dict['dataset-id']
 
     # this is a primitive mechanism to break the files down into smaller chunks by putting
     # them into separate directories that contain files of __SEGMENT_BUCKET_SIZE_MINUTES__
     # minutes worth of data
-    segment_id: str = _make_segment_identifier(start_time)
-
-    telemetry_dict: Dict[str, str] = _body_to_dict(event)
-    dataset_id: str = telemetry_dict['dataset-id']
+    segment_id: str = _make_segment_identifier(int(telemetry_dict['timestamp-ns']))
 
     if __USE_SQLITE_STORAGE__:
         return _lambda_handler_sqlite(event, context, dataset_id, segment_id, telemetry_dict)

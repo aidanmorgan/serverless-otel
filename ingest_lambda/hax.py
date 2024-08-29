@@ -10,9 +10,9 @@ import ingest_lambda, s3_mutex
 NUM_ITERATIONS: Final[int] = 1500000
 
 if __name__ == '__main__':
-    ingest_lambda.__STORAGE_BASE_PATH__ = tempfile.mkdtemp()
-    ingest_lambda.__USE_S3_MUTEX__ = True
-    ingest_lambda.__USE_FILESYSTEM_MUTEX__ = False
+    ingest_lambda.__STORAGE_BASE_PATH__ = '/tmp/hax'
+    ingest_lambda.__USE_S3_MUTEX__ = False
+    ingest_lambda.__USE_FILESYSTEM_MUTEX__ = True
 
     s3_mutex.__BUCKET_NAME__ = 'dev-serverless-otel-segments'
     s3_mutex.__PROFILE_NAME__ = 'aidan-personal'

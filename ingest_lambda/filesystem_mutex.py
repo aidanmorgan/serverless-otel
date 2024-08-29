@@ -5,6 +5,7 @@ from collections import namedtuple
 from typing import Callable
 
 from constants import *
+from mutex import SegmentLockError, SegmentUnlockError
 
 __LOCK_DIRECTORY__: str = '.locks'
 
@@ -72,21 +73,16 @@ def nfs_unlock_segment(basedir: str, dataset_id: str, segment: str, instance: st
     instance_lockfile: str = _get_instance_lockfile(dataset_base, segment, instance)
 
     if instance_lockfile != lock.Lockfile:
-        raise SegmentLockError('Cannot unlock segment')
+        raise SegmentUnlockError('Cannot unlock segment')
 
     current_lock: str = os.readlink(segment_lockfile)
 
     if current_lock != instance_lockfile:
-        raise SegmentLockError('Cannot unlock segment, not owned by instance')
+        raise SegmentUnlockError('Cannot unlock segment, not owned by instance')
     else:
         try:
             os.unlink(segment_lockfile)
         except OSError as err:
-            raise SegmentLockError('Cannot unlock segment, probably a deadlock')
+            raise SegmentUnlockError(f'Cannot unlock segment, probably a deadlock. {err}')
 
 
-class SegmentLockError(Exception):
-    pass
-
-class SegmentUnlockError(Exception):
-    pass
