@@ -1,14 +1,16 @@
+import json
+import os
 import time
 from concurrent.futures.process import ProcessPoolExecutor
 from random import random
-from typing import Final, List
+from typing import Final, List, Dict
 from uuid import uuid4
 
 import lorem
 import requests
 import random
 
-__API_URL__ : Final[str] = 'https://trvkgujvoa.execute-api.us-east-1.amazonaws.com/prod/ingest'
+__API_URL__ : Final[str] = os.getenv('API_URL')
 
 __FIELD_NAMES__: List[str] = ['service_name.varchar', 'operation_name.varchar', 'status_code.int64', 'http_method.varchar', 'http_url.varchar', 'http_status_code.int64', 'queue_name.varchar', 'message_id.varchar', 'duration.float64', 'user_id.int64', 'session_id.varchar', 'region.varchar', 'instance_id.int64', 'environment.varchar', 'version.float64']
 __DATASET_NAMES__: List[str] = ['fake-data-1', 'fake-data-2', 'fake-data-3']
@@ -38,8 +40,12 @@ def run_one_loop():
     for i in range(1, __MAX_REQUESTS__):
         data:str = make_payload()
 
+        dict: Dict[str, str] = {
+            'body': data,
+        }
+
         start: int = time.time_ns()
-        x: Response = requests.post(__API_URL__, data=data, headers={'Content-Type': 'text/plain; charset=utf-8'})
+        x: Response = requests.post(__API_URL__, data=json.dumps(dict), headers={'Content-Type': 'text/plain; charset=utf-8'})
         end: int = time.time_ns()
 
         print(f'POST: {data.count('=') - 3} fields. Response: {x.status_code}. Took: {(end-start) / NS_PER_MS} ns')

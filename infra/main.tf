@@ -10,6 +10,7 @@ variable "prefix" {
   default = "dev"
 }
 
+
 provider "aws" {
   region = var.aws_region
   profile = "aidan-personal"
@@ -119,19 +120,38 @@ resource "aws_iam_role_policy_attachment" "ingest_lambda_efs_access" {
   policy_arn = "arn:aws:iam::aws:policy/AmazonElasticFileSystemClientFullAccess"
 }
 
+resource "aws_iam_role_policy_attachment" "ingest_lambda_xray_write" {
+  role       = aws_iam_role.ingest_lambda_exec_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess"
+}
+
+
 
 # Create the Lambda function
 resource "aws_lambda_function" "serverless_otel_ingest" {
   function_name = "${var.prefix}-serverless-otel-ingest"
   role          = aws_iam_role.ingest_lambda_exec_role.arn
   handler       = "ingest_lambda.lambda_handler"
-  runtime       = "python3.12"
-  filename      = "../ingest-lambda/lambda.zip"
+  runtime       = "python3.11"
+  filename      = "../ingest_lambda/lambda.zip"
+  architectures = ["x86_64"]
+  timeout       = 5
+
+  # add in the layer that adds otel support to the lambda
+  layers = [
+    "arn:aws:lambda:${var.aws_region}:901920570463:layer:aws-otel-python-amd64-ver-1-25-0:1"
+  ]
+
+  tracing_config {
+    mode = "Active"
+  }
 
   environment {
     variables = {
-      SHARED_STORAGE_BASEDIR = "/mnt/otel-hot"
-      USE_FILESYSTEM_MUTEX = "True"
+      SHARED_STORAGE_BASEDIR  = "/mnt/otel-hot"
+      USE_FILESYSTEM_MUTEX    = "True"
+      USE_SQLITE_STORAGE      = "True"
+      AWS_LAMBDA_EXEC_WRAPPER ="/opt/otel-instrument"
     }
   }
 

@@ -3,15 +3,15 @@ import io
 import json
 import math
 from sqlite3 import Connection
-from typing import Callable, Optional
 from typing import List, Dict
 from uuid import uuid4
 
-from constants import *
 from filesystem_mutex import *
 from s3_mutex import *
 
 import sqlite3
+
+tracer = trace.get_tracer(__name__)
 
 def _create_csv_string(correlation_id: str, timestamp: str, value: str) -> str:
     # we cant control what a bunch of this stuff is, so we need to just use a proper CSV formatter to format the output
@@ -53,17 +53,14 @@ __ALLOWED_DATA_TYPE_SUFFIXES__: Final[List[str]] = ['.int64', '.varchar', '.floa
 
 # How we should be controlling access to the files - either NFS, S3 or None (default)
 # NFI what will happen if you turn them both on other than a spectacular deadlock :-|
-__USE_FILESYSTEM_MUTEX__: Final[bool] = bool(os.getenv('USE_FILESYSTEM_MUTEX', default='False'))
-__USE_S3_MUTEX__: Final[bool] = bool(os.getenv('USE_S3_MUTEX', default='False'))
+__USE_FILESYSTEM_MUTEX__: Final[bool] = True
+__USE_S3_MUTEX__: Final[bool] = False
 
-__USE_DIRECTORY_AND_FILE_STORAGE__: Final[bool] = bool(os.getenv('USE_DIRECTORY_AND_FILE_STORAGE', default='False'))
-__USE_SQLITE_STORAGE__: Final[bool] = bool(os.getenv('USE_SQLITE_STORAGE', default='True'))
+__USE_COLUMNFILES_STORAGE__: Final[bool] = False
+__USE_SQLITE_STORAGE__: Final[bool] = True
+
 
 def lambda_handler(event, context):
-    if __USE_S3_MUTEX__ and __USE_FILESYSTEM_MUTEX__:
-        print(f'Cant have both mutexes enabled')
-        return 500
-
     telemetry_dict: Dict[str, str] = _body_to_dict(event)
     dataset_id: str = telemetry_dict['dataset-id']
 
@@ -75,98 +72,116 @@ def lambda_handler(event, context):
     if __USE_SQLITE_STORAGE__:
         return _lambda_handler_sqlite(event, context, dataset_id, segment_id, telemetry_dict)
 
-    if __USE_DIRECTORY_AND_FILE_STORAGE__:
+    if __USE_COLUMNFILES_STORAGE__:
         return _lambda_handler_files(event, context, dataset_id, segment_id, telemetry_dict)
-
-    print(f'Neither storage mechanisms are enabled.')
-    return 500
 
 def _lambda_handler_sqlite(event, context, dataset_id: str, segment_id: str, telemetry_dict: Dict[str,Any]):
     nfs_initialise_segment_locks(__STORAGE_BASE_PATH__, dataset_id, __INSTANCE_ID__, segment_id)
 
-    con: Optional[Connection] = None
-    lock: Optional[Any] = None
+    with tracer.start_as_current_span('_lambda_handler_sqlite') as span:
+        con: Optional[Connection] = None
+        lock: Optional[Any] = None
 
-    try:
-        if __USE_FILESYSTEM_MUTEX__:
-            lock = nfs_lock_segment(__STORAGE_BASE_PATH__, dataset_id, segment_id, __INSTANCE_ID__, __UTC_NOW_NANOS__)
+        timestamp: str = telemetry_dict['timestamp-ns']
+        correlation_id: str = telemetry_dict['correlation-id']
 
-        if __USE_S3_MUTEX__:
-            lock = s3_lock_segment(dataset_id, segment_id, __INSTANCE_ID__, __UTC_NOW_NANOS__)
+        span.set_attribute('dataset_id', dataset_id)
+        span.set_attribute('segment_id', segment_id)
+        span.set_attribute('correlation_id', correlation_id)
+        span.set_attribute('timestamp', timestamp)
+        span.set_attribute('keys', ','.join(telemetry_dict.keys()))
 
-        data_file: str = os.path.join(__STORAGE_BASE_PATH__, dataset_id, segment_id, f'{segment_id}.sqlite')
-        database_exists: bool = os.path.exists(data_file)
-
-        con = sqlite3.connect(data_file)
-        con.execute('PRAGMA journal_mode = WAL')
-        con.execute('PRAGMA synchronous = NORMAL')
-        con.execute('PRAGMA temp_store = memory')
-
-        if not database_exists:
-            con.execute('CREATE TABLE segment_data (correlation_id TEXT PRIMARY KEY, timestamp INTEGER, payload TEXT)')
-            print(f'Created new database at {data_file}')
-
-        con.execute('INSERT INTO segment_data(timestamp, correlation_id, payload) VALUES (?, ?, ?)', (telemetry_dict['timestamp-ns'], telemetry_dict['correlation-id'], json.dumps(telemetry_dict)))
-        con.commit()
-    except BodyError as err:
-        print(f'Invalid body content for Segment {segment_id}. {err}')
-        return 400
-    except SegmentLockError as err:
-        print(f'Error locking Segment {segment_id}. {err}')
-        return 500
-    finally:
         try:
             if __USE_FILESYSTEM_MUTEX__:
-                nfs_unlock_segment(__STORAGE_BASE_PATH__, dataset_id, segment_id, __INSTANCE_ID__, lock)
+                lock = nfs_lock_segment(__STORAGE_BASE_PATH__, dataset_id, segment_id, __INSTANCE_ID__, __UTC_NOW_NANOS__)
 
             if __USE_S3_MUTEX__:
-                s3_unlock_segment(dataset_id, segment_id, __INSTANCE_ID__, lock)
-        except SegmentLockError as err:
-            print(f'Error unlocking Segment {segment_id}. {err}')
+                lock = s3_lock_segment(dataset_id, segment_id, __INSTANCE_ID__, __UTC_NOW_NANOS__)
 
-        con.close()
+            data_file: str = os.path.join(__STORAGE_BASE_PATH__, dataset_id, segment_id, f'{segment_id}.sqlite')
+            span.set_attribute('database_path', data_file)
+
+            database_exists: bool = os.path.exists(data_file)
+
+            con = sqlite3.connect(data_file)
+            con.execute('PRAGMA journal_mode = WAL')
+            con.execute('PRAGMA synchronous = NORMAL')
+            con.execute('PRAGMA temp_store = memory')
+
+            if not database_exists:
+                span.add_event(f'created database')
+                con.execute('CREATE TABLE segment_data (correlation_id TEXT PRIMARY KEY, timestamp INTEGER, payload TEXT)')
+
+            con.execute('INSERT INTO segment_data(timestamp, correlation_id, payload) VALUES (?, ?, ?)', (timestamp, correlation_id, json.dumps(telemetry_dict)))
+            con.commit()
+        except BodyError as err:
+            print(f'Invalid body content for Segment {segment_id}. {err}')
+            return 400
+        except SegmentLockError as err:
+            print(f'Error locking Segment {segment_id}. {err}')
+            return 500
+        finally:
+            try:
+                if __USE_FILESYSTEM_MUTEX__:
+                    nfs_unlock_segment(__STORAGE_BASE_PATH__, dataset_id, segment_id, __INSTANCE_ID__, lock)
+
+                if __USE_S3_MUTEX__:
+                    s3_unlock_segment(dataset_id, segment_id, __INSTANCE_ID__, lock)
+            except SegmentLockError as err:
+                print(f'Error unlocking Segment {segment_id}. {err}')
+
+            con.close()
 
 # implementation of the lambda handler that uses files for storing
 def _lambda_handler_files(event, context, dataset_id: str, segment_id: str, telemetry_dict: Dict[str,Any]):
+    timestamp: str = telemetry_dict['timestamp-ns']
+    correlation_id: str = telemetry_dict['correlation-id']
+
     # the initialise_segment_locks ensures that the directories that are needed for storing the files are in
     # place, as well as their corresponding lock directories
     nfs_initialise_segment_locks(__STORAGE_BASE_PATH__, dataset_id, __INSTANCE_ID__, segment_id)
 
-    try:
-        # these are very coarse-grained locks, we're locking the whole segment (15 minutes of data) could probably be
-        # refined to actually lock the specific file we are attempting to update, and probably even run in parallel
-        # HOWEVER - this then creates a weird rollback situation if we have been able to write to some files, but not all
-        # then we have thrown away data, so leaving this as the coarse-grained lock for the time being...
-        if __USE_FILESYSTEM_MUTEX__:
-            nfs_lock_segment(__STORAGE_BASE_PATH__, dataset_id, segment_id, __INSTANCE_ID__, __UTC_NOW_NANOS__)
+    with tracer.start_as_current_span('_lambda_handler_files') as span:
+        span.set_attribute(f'dataset_id', dataset_id)
+        span.set_attribute(f'segment_id', segment_id)
+        span.set_attribute(f'correlation_id', correlation_id)
+        span.set_attribute(f'timestamp', timestamp)
+        span.set_attribute(f'keys', ','.join(telemetry_dict.keys()))
 
-        if __USE_S3_MUTEX__:
-            s3_lock_segment(dataset_id, segment_id, __INSTANCE_ID__, __UTC_NOW_NANOS__)
-
-        for key in telemetry_dict.keys():
-            if key in __REQUIRED_KEYS__ or not any(
-                    suffix for suffix in __ALLOWED_DATA_TYPE_SUFFIXES__ if key.endswith(suffix)):
-                continue
-
-            _append_record(dataset_id, segment_id, telemetry_dict['timestamp-ns'], telemetry_dict['correlation-id'],
-                           key, telemetry_dict[key])
-
-        return 200
-    except BodyError as err:
-        print(f'Invalid body payload. {err}')
-        return 503
-    except SegmentLockError as err:
-        print(f'Could not lock segment {segment_id} for instance {__INSTANCE_ID__}, {err}')
-        return 503
-    finally:
         try:
+            # these are very coarse-grained locks, we're locking the whole segment (15 minutes of data) could probably be
+            # refined to actually lock the specific file we are attempting to update, and probably even run in parallel
+            # HOWEVER - this then creates a weird rollback situation if we have been able to write to some files, but not all
+            # then we have thrown away data, so leaving this as the coarse-grained lock for the time being...
             if __USE_FILESYSTEM_MUTEX__:
-                nfs_unlock_segment(__STORAGE_BASE_PATH__, dataset_id, segment_id, __INSTANCE_ID__)
+                nfs_lock_segment(__STORAGE_BASE_PATH__, dataset_id, segment_id, __INSTANCE_ID__, __UTC_NOW_NANOS__)
 
             if __USE_S3_MUTEX__:
-                s3_unlock_segment(dataset_id, segment_id, __INSTANCE_ID__)
+                s3_lock_segment(dataset_id, segment_id, __INSTANCE_ID__, __UTC_NOW_NANOS__)
+
+            for key in telemetry_dict.keys():
+                if key in __REQUIRED_KEYS__ or not any(
+                        suffix for suffix in __ALLOWED_DATA_TYPE_SUFFIXES__ if key.endswith(suffix)):
+                    continue
+
+                _append_record(dataset_id, segment_id, timestamp, correlation_id, key, telemetry_dict[key])
+
+            return 200
+        except BodyError as err:
+            print(f'Invalid body payload. {err}')
+            return 503
         except SegmentLockError as err:
-            print(f'Could not unlock segment {segment_id} for instance {__INSTANCE_ID__}, {err}')
+            print(f'Could not lock segment {segment_id} for instance {__INSTANCE_ID__}, {err}')
+            return 503
+        finally:
+            try:
+                if __USE_FILESYSTEM_MUTEX__:
+                    nfs_unlock_segment(__STORAGE_BASE_PATH__, dataset_id, segment_id, __INSTANCE_ID__)
+
+                if __USE_S3_MUTEX__:
+                    s3_unlock_segment(dataset_id, segment_id, __INSTANCE_ID__)
+            except SegmentLockError as err:
+                print(f'Could not unlock segment {segment_id} for instance {__INSTANCE_ID__}, {err}')
 
 
 def _make_segment_identifier(current_nanos: int):
