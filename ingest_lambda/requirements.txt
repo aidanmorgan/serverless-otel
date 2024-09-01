@@ -1,5 +1,4 @@
 boto3
 botocore
 python-lru
-opentelemetry-distro
-opentelemetry-exporter-otlp
+opentelemetry-api

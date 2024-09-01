@@ -40,8 +40,8 @@ from opentelemetry.trace import StatusCode
 from constants import *
 from mutex import SegmentLockError, SegmentUnlockError
 
-__LOCK_DIRECTORY__: Final[str] = '.locks'
-__LRU_CACHE_SIZE__: Final[int] = 50
+LOCK_DIRECTORY: Final[str] = '.locks'
+LRU_CACHE_SIZE: Final[int] = 50
 
 NfsLockIdentifier = namedtuple('NfsLockIdentifier', ['lockfile', 'timestamp'])
 
@@ -51,7 +51,7 @@ initialisation_cache: LRUCache = LRUCache(max_age=timedelta(minutes=15))
 tracer = trace.get_tracer(__name__)
 
 def _get_segment_lockdir(basedir: str, segment: str) -> str:
-    return os.path.join(basedir, segment, __LOCK_DIRECTORY__)
+    return os.path.join(basedir, segment, LOCK_DIRECTORY)
 
 
 def _get_segment_lockfile(basedir: str, segment: str) -> str:
@@ -68,13 +68,15 @@ def _get_instance_lockfile(basedir: str, segment: str, instance: str) -> str:
 def nfs_initialise_segment_locks(basedir: str, dataset_id: str, instance: str, segment: str):
     key: InitialisationKey = InitialisationKey(dataset_id, instance, segment)
 
+    # check the cache to see if we have already initialised previously, that way
+    # we don't need to waste time with additional OS calls
     try:
         exists:bool = initialisation_cache[key]
         return
     except ItemNotCached:
         pass
 
-    with tracer.start_as_current_span('nfs_initialise_segment_locks') as span:
+    with tracer.start_span('nfs_initialise_segment_locks') as span:
         dataset_base: str = os.path.join(basedir, dataset_id)
 
         segment_lockpath: str = _get_segment_lockdir(dataset_base, segment)
@@ -109,7 +111,7 @@ def nfs_initialise_segment_locks(basedir: str, dataset_id: str, instance: str, s
 def nfs_lock_segment(basedir: str, dataset_id: str, segment: str, instance: str, utc_nanos: Callable[[], int],
                  timeout: int = 10, delay: int = 1) -> NfsLockIdentifier:
 
-    with tracer.start_as_current_span('nfs_lock_segment') as span:
+    with tracer.start_span('nfs_lock_segment') as span:
         dataset_base: str = os.path.join(basedir, dataset_id)
 
         segment_lockfile: str = _get_segment_lockfile(dataset_base, segment)
@@ -148,7 +150,7 @@ def nfs_unlock_segment(basedir: str, dataset_id: str, segment: str, instance: st
     if lock is None:
         raise SegmentUnlockError(f'Cannot unlock segment, no lock held.')
 
-    with tracer.start_as_current_span('nfs_unlock_segment') as span:
+    with tracer.start_span('nfs_unlock_segment') as span:
         dataset_base: str = os.path.join(basedir, dataset_id)
 
         instance_lockfile: str = _get_instance_lockfile(dataset_base, segment, instance)

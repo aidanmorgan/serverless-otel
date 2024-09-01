@@ -108,13 +108,11 @@ resource "aws_iam_role" "ingest_lambda_exec_role" {
   })
 }
 
-# Attach the AWSLambdaVPCAccessExecutionRole policy to the IAM role
 resource "aws_iam_role_policy_attachment" "ingest_lambda_vpc_access" {
   role       = aws_iam_role.ingest_lambda_exec_role.name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
 }
 
-# Attach the AWSLambdaEFSAccessExecutionRole policy to the IAM role
 resource "aws_iam_role_policy_attachment" "ingest_lambda_efs_access" {
   role       = aws_iam_role.ingest_lambda_exec_role.name
   policy_arn = "arn:aws:iam::aws:policy/AmazonElasticFileSystemClientFullAccess"
@@ -122,20 +120,17 @@ resource "aws_iam_role_policy_attachment" "ingest_lambda_efs_access" {
 
 resource "aws_iam_role_policy_attachment" "ingest_lambda_xray_write" {
   role       = aws_iam_role.ingest_lambda_exec_role.name
-  policy_arn = "arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess"
+  policy_arn = "arn:aws:iam::aws:policy/AWSXrayWriteOnlyAccess"
 }
 
-
-
-# Create the Lambda function
 resource "aws_lambda_function" "serverless_otel_ingest" {
   function_name = "${var.prefix}-serverless-otel-ingest"
   role          = aws_iam_role.ingest_lambda_exec_role.arn
-  handler       = "ingest_lambda.lambda_handler"
+  handler       = "lambda_function.lambda_handler"
   runtime       = "python3.11"
   filename      = "../ingest_lambda/lambda.zip"
   architectures = ["x86_64"]
-  timeout       = 5
+  timeout       = 300
 
   # add in the layer that adds otel support to the lambda
   layers = [
@@ -148,10 +143,9 @@ resource "aws_lambda_function" "serverless_otel_ingest" {
 
   environment {
     variables = {
-      SHARED_STORAGE_BASEDIR  = "/mnt/otel-hot"
-      USE_FILESYSTEM_MUTEX    = "True"
-      USE_SQLITE_STORAGE      = "True"
-      AWS_LAMBDA_EXEC_WRAPPER ="/opt/otel-instrument"
+      SHARED_STORAGE_BASEDIR              = "/mnt/otel-hot"
+      AWS_LAMBDA_EXEC_WRAPPER             ="/opt/otel-instrument"
+      OPENTELEMETRY_COLLECTOR_CONFIG_FILE = "/var/task/collector.yaml"
     }
   }
 
@@ -166,12 +160,20 @@ resource "aws_lambda_function" "serverless_otel_ingest" {
   }
 }
 
-resource "aws_lambda_permission" "ingest_lambda_public_access" {
-  action        = "lambda:InvokeFunctionUrl"
+resource "aws_lambda_function_event_invoke_config" "ingest_lambda_invoke_config" {
   function_name = aws_lambda_function.serverless_otel_ingest.function_name
-  function_url_auth_type = "NONE"
-  principal     = "*"
+  qualifier     = aws_lambda_function.serverless_otel_ingest.version
+
+  maximum_event_age_in_seconds = 300
+  maximum_retry_attempts       = 2
 }
+
+#resource "aws_lambda_permission" "ingest_lambda_public_access" {
+#  action        = "lambda:InvokeFunctionUrl"
+#  function_name = aws_lambda_function.serverless_otel_ingest.function_name
+#  function_url_auth_type = "NONE"
+#  principal     = "*"
+#}
 
 resource "aws_api_gateway_rest_api" "ingest_lambda_rest_api" {
   name        = "${var.prefix}-serverless-otel-ingest-api"
@@ -198,6 +200,8 @@ resource "aws_api_gateway_integration" "ingest_lambda_rest_api_resource_integrat
   uri                     = aws_lambda_function.serverless_otel_ingest.invoke_arn
   integration_http_method = "POST"
   type                    = "AWS"
+
+  # set the ingest lambda to execute in async mode
   request_parameters      = {
     "integration.request.header.X-Amz-Invocation-Type" = "'Event'"
   }
@@ -234,7 +238,7 @@ resource "aws_api_gateway_deployment" "ingest_lambda_rest_api_deployment" {
 }
 
 # Allow API Gateway to invoke the Lambda function
-resource "aws_lambda_permission" "api_gateway_lambda" {
+resource "aws_lambda_permission" "api_gateway_ingest_lambda_invoke" {
   statement_id  = "AllowAPIGatewayInvoke"
   action        = "lambda:InvokeFunction"
   function_name = aws_lambda_function.serverless_otel_ingest.function_name
