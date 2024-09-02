@@ -2,15 +2,18 @@ import csv
 import io
 import json
 import math
+import os
 from sqlite3 import Connection
 from typing import List, Dict
 from uuid import uuid4
 
-from opentelemetry.trace import Link
+from aws_lambda_typing.events import APIGatewayProxyEventV2
+from aws_lambda_typing import context as context_, events
 
 from filesystem_mutex import *
+from errors import BodyError
+from env_utils import str_as_bool
 from s3_mutex import *
-
 import sqlite3
 
 
@@ -37,12 +40,6 @@ FORMAT_SEGMENT_LINE: Callable[[str, str, str], str] = _create_csv_string
 INSTANCE_ID: Final[str] = uuid4().hex
 
 # this needs to be the mount point for the NFS share that is common to all of the lambdas
-STORAGE_BASE_PATH: Final[str] = os.getenv('SHARED_STORAGE_BASEDIR', default='/mnt/otel-hot/segments')
-
-# in an attempt to keep the file sizes at a manageable level, we try to partition the files into
-# roughly this number of minutes of data, which allows the query engine side to work out which
-# files to parse
-SEGMENT_BUCKET_SIZE_MINUTES: Final[int] = int(os.getenv('SEGMENT_BUCKET_SIZE_MINUTES', default='15'))
 
 # which keys are considered required and therefore shouldn't be written as their own column files,
 # these values will be embedded into each column file to allow the files to be combined
@@ -54,14 +51,18 @@ ALLOWED_DATA_TYPE_SUFFIXES: Final[List[str]] = ['.int64', '.varchar', '.float64'
 
 # How we should be controlling access to the files - either NFS, S3 or None (default)
 # NFI what will happen if you turn them both on other than a spectacular deadlock :-|
-USE_FILESYSTEM_MUTEX: Final[bool] = True
-USE_S3_MUTEX: Final[bool] = False
+USE_FILESYSTEM_MUTEX: Final[bool] = str_as_bool(os.getenv('USE_FILESYSTEM_MUTEX', 'True'))
+USE_S3_MUTEX: Final[bool] = str_as_bool(os.getenv('USE_S3_MUTEX', 'False'))
 
-USE_COLUMNFILES_STORAGE: Final[bool] = False
-USE_SQLITE_STORAGE: Final[bool] = True
+USE_SQLITE_STORAGE: Final[bool] = str_as_bool(os.getenv('USE_SQLITE_STORAGE', 'True'))
+USE_COLUMNFILE_STORAGE: Final[bool] = str_as_bool(os.getenv('USE_COLUMNFILE_STORAGE', 'False'))
 
+STORAGE_BASE_PATH: Final[str] = os.getenv('SHARED_STORAGE_BASEDIR', '/mnt/otel-hot/segments')
+SEGMENT_BUCKET_SIZE_MINUTES: Final[int] = int(os.getenv('SEGMENT_BUCKET_SIZE_MINUTES', '15'))
 
-def lambda_handler(event, context):
+tracer = trace.get_tracer(__name__)
+
+def lambda_handler(event: APIGatewayProxyEventV2, context: context_.Context):
     telemetry_dict: Dict[str, str] = _body_to_dict(event)
     dataset_id: str = telemetry_dict['dataset-id']
 
@@ -71,17 +72,16 @@ def lambda_handler(event, context):
     segment_id: str = _make_segment_identifier(int(telemetry_dict['timestamp-ns']))
 
     if USE_SQLITE_STORAGE:
-        return _lambda_handler_sqlite(event, context, dataset_id, segment_id, telemetry_dict)
+       return _lambda_handler_sqlite(event, context, dataset_id, segment_id, telemetry_dict)
 
-    if USE_COLUMNFILES_STORAGE:
+    if USE_COLUMNFILE_STORAGE:
         return _lambda_handler_files(event, context, dataset_id, segment_id, telemetry_dict)
 
 
 def _lambda_handler_sqlite(event, context, dataset_id: str, segment_id: str, telemetry_dict: Dict[str,Any]):
     nfs_initialise_segment_locks(STORAGE_BASE_PATH, dataset_id, INSTANCE_ID, segment_id)
 
-    lambda_context = trace.get_current_span().get_span_context()
-    with tracer.start_as_current_span('lambda_handler_sqlite', links=[Link(lambda_context)]) as span:
+    with tracer.start_as_current_span('lambda_handler_sqlite') as span:
         con: Optional[Connection] = None
         lock: Optional[Any] = None
 
@@ -118,6 +118,8 @@ def _lambda_handler_sqlite(event, context, dataset_id: str, segment_id: str, tel
             con.execute('INSERT INTO segment_data(timestamp, correlation_id, payload) VALUES (?, ?, ?)', (timestamp, correlation_id, json.dumps(telemetry_dict)))
             con.commit()
 
+            print(f'Wrote value to {data_file}.')
+
             return 201
         except BodyError as err:
             print(f'Invalid body content for Segment {segment_id}. {err}')
@@ -139,8 +141,6 @@ def _lambda_handler_sqlite(event, context, dataset_id: str, segment_id: str, tel
 
 # implementation of the lambda handler that uses files for storing
 def _lambda_handler_files(event, context, dataset_id: str, segment_id: str, telemetry_dict: Dict[str,Any]):
-    lambda_context = trace.get_current_span().get_span_context()
-
     timestamp: str = telemetry_dict['timestamp-ns']
     correlation_id: str = telemetry_dict['correlation-id']
 
@@ -148,7 +148,7 @@ def _lambda_handler_files(event, context, dataset_id: str, segment_id: str, tele
     # place, as well as their corresponding lock directories
     nfs_initialise_segment_locks(STORAGE_BASE_PATH, dataset_id, INSTANCE_ID, segment_id)
 
-    with tracer.start_as_current_span('lambda_handler_files', links=[Link(lambda_context)]) as span:
+    with tracer.start_as_current_span('lambda_handler_files') as span:
         span.set_attribute('dataset_id', dataset_id)
         span.set_attribute('segment_id', segment_id)
         span.set_attribute('correlation_id', correlation_id)
@@ -207,7 +207,7 @@ def _get_file_path_for_column(basedir: str, dataset_id: str, segment: str, key: 
     return data_file
 
 
-def _body_to_dict(event) -> Dict[str, str]:
+def _body_to_dict(event: APIGatewayProxyEventV2) -> Dict[str, str]:
     body: str = event['body']
 
     key_value: Dict[str, str] = dict()
@@ -258,5 +258,4 @@ def _append_record(dataset_id: str, segment_id: str, timestamp: str, correlation
         column_file.flush()
 
 
-class BodyError(Exception):
-    pass
+

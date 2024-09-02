@@ -10,7 +10,7 @@ from opentelemetry.trace import StatusCode
 
 from constants import NS_PER_S
 from botocore.exceptions import ClientError
-from mutex import SegmentLockError, SegmentUnlockError
+from errors import SegmentLockError, SegmentUnlockError
 
 PROFILE_NAME: Final[Optional[str]] = os.getenv('PROFILE_NAME', None)
 BUCKET_NAME: Final[str] = os.getenv('SEGMENT_LOCK_BUCKET', 'dev-serverless-otel-segments')

@@ -3,3 +3,6 @@ class SegmentLockError(Exception):
 
 class SegmentUnlockError(Exception):
     pass
+
+class BodyError(Exception):
+    pass

@@ -1,1 +1,2 @@
 python-lru
+aws_lambda_typing

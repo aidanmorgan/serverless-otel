@@ -3,15 +3,16 @@ rm lambda.zip
 
 mkdir -p build
 
-cp -r *.py build
-cp -r *.yaml build
+cp -r ./*.py build
+cp -r ./*.yaml build
 pip install -r requirements-aws.txt -t build/
-rm -rf build/bin # remove any binarys installed by `pip`
+rm -rf build/bin
 
-pushd build
-zip -r lambda.zip *
-popd
+pushd build || exit
+zip -r lambda.zip ./*
+popd || exit
 mv build/lambda.zip .
+
 rm -rf build
 
 
