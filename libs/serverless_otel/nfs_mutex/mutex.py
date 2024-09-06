@@ -28,7 +28,6 @@
 import errno
 import os
 import time
-from collections import namedtuple
 from datetime import timedelta
 from typing import Callable
 
@@ -37,8 +36,8 @@ from lru.CacheStorage import ItemNotCached
 from opentelemetry import trace
 from opentelemetry.trace import StatusCode, Span
 
-from constants import *
-from errors import SegmentLockError, SegmentUnlockError
+from serverless_otel.common.constants import *
+from serverless_otel.common.errors import SegmentLockError, SegmentUnlockError
 
 LOCK_DIRECTORY: Final[str] = '.locks'
 LRU_CACHE_SIZE: Final[int] = 50
@@ -49,6 +48,7 @@ InitialisationKey = namedtuple('InitialisationKey', ['dataset_id', 'instance', '
 initialisation_cache: LRUCache = LRUCache(max_age=timedelta(minutes=15))
 
 fs_tracer = trace.get_tracer(__name__)
+
 
 def _get_segment_lockdir(basedir: str, segment: str) -> str:
     return os.path.join(basedir, segment, LOCK_DIRECTORY)
@@ -62,7 +62,6 @@ def _get_instance_lockfile(basedir: str, segment: str, instance: str) -> str:
     return os.path.join(_get_segment_lockdir(basedir, segment), f'{instance}.lck')
 
 
-
 # ensures that the required files and directories are in place for the segment locking approach
 # to work appropriately
 @fs_tracer.start_as_current_span("nfs_initialise_segment_locks")
@@ -73,7 +72,7 @@ def nfs_initialise_segment_locks(basedir: str, dataset_id: str, instance: str, s
     # check the cache to see if we have already initialised previously, that way
     # we don't need to waste time with additional OS calls
     try:
-        exists:bool = initialisation_cache[key]
+        exists: bool = initialisation_cache[key]
         span.set_attribute('segment_lockpath_cached', 'True')
 
         return
@@ -90,7 +89,6 @@ def nfs_initialise_segment_locks(basedir: str, dataset_id: str, instance: str, s
     span.set_attribute(f'segment_lockfile', segment_lockfile)
     span.set_attribute(f'segment_lockpath_exists', os.path.exists(segment_lockpath))
 
-
     if not os.path.exists(segment_lockpath):
         os.makedirs(segment_lockpath)
 
@@ -104,13 +102,13 @@ def nfs_initialise_segment_locks(basedir: str, dataset_id: str, instance: str, s
 
     initialisation_cache[key] = True
 
+
 # attempts to get an exclusive lock on the directory for the dataset and segment, it does this by
 # repeatedly attempting to create a symlink between the instance lock file and the directory lock file
 # as this is MEANT to be an atomic operation on a NFS file share.
 @fs_tracer.start_as_current_span("nfs_lock_segment")
 def nfs_lock_segment(basedir: str, dataset_id: str, segment: str, instance: str, utc_nanos: Callable[[], int],
-                 timeout: int = 10, delay: int = 1) -> NfsLockIdentifier:
-
+                     timeout: int = 10, delay: int = 1) -> NfsLockIdentifier:
     span: Span = trace.get_current_span()
     dataset_base: str = os.path.join(basedir, dataset_id)
 
@@ -121,7 +119,7 @@ def nfs_lock_segment(basedir: str, dataset_id: str, segment: str, instance: str,
     span.set_attribute('instance_lockfile', instance_lockfile)
 
     start: int = utc_nanos()
-    retry_count:int = 0
+    retry_count: int = 0
 
     # this is primitive, but it will work for these experiments, really need to replace with a proper
     # bulkhead and exponential backoff approach. Probably should also consider having two NFS mounts available
@@ -147,6 +145,7 @@ def nfs_lock_segment(basedir: str, dataset_id: str, segment: str, instance: str,
     span.set_status(StatusCode.ERROR, 'Timeout')
     raise SegmentLockError(f'Failed to lock segment {segment_lockfile}, timed out.')
 
+
 # attempts to release the exclusive lock for the dataset and segment, it does this by
 # validating that the symlink is pointing to the relevant instance lock file and then
 # unlinking the file if the lock is present
@@ -165,13 +164,15 @@ def nfs_unlock_segment(basedir: str, dataset_id: str, segment: str, instance: st
     span.set_attribute('instance_lockfile', instance_lockfile)
 
     if instance_lockfile != lock.lockfile:
-        span.set_status(StatusCode.ERROR, f'Unlock failed, owned by {lock.lockfile} but requested by {instance_lockfile}')
+        span.set_status(StatusCode.ERROR,
+                        f'Unlock failed, owned by {lock.lockfile} but requested by {instance_lockfile}')
         raise SegmentUnlockError(f'Cannot unlock segment {segment_lockfile}, it is owned by {lock.lockfile}')
 
     current_lock: str = os.readlink(segment_lockfile)
 
     if current_lock != instance_lockfile:
-        span.set_status(StatusCode.ERROR, f'Unlock failed, owned by {current_lock} but requested by {instance_lockfile}')
+        span.set_status(StatusCode.ERROR,
+                        f'Unlock failed, owned by {current_lock} but requested by {instance_lockfile}')
         raise SegmentUnlockError(f'Cannot unlock segment {segment_lockfile}, it is owned by {current_lock}')
     else:
         try:
@@ -183,4 +184,3 @@ def nfs_unlock_segment(basedir: str, dataset_id: str, segment: str, instance: st
         except Exception as err:
             span.set_status(StatusCode.ERROR, str(err))
             raise SegmentUnlockError(f'Cannot unlock segment, unexpected exception. {err}')
-

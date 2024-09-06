@@ -2,19 +2,25 @@ import csv
 import io
 import json
 import math
+import sqlite3
+import time
 import os
 from sqlite3 import Connection
-from typing import List, Dict
+from typing import List, Dict, Optional, Any, Callable
 from uuid import uuid4
 
-from aws_lambda_typing.events import APIGatewayProxyEventV2
-from aws_lambda_typing import context as context_, events
+from opentelemetry.trace import Tracer, get_tracer
 
-from filesystem_mutex import *
-from errors import BodyError
-from env_utils import str_as_bool
-from s3_mutex import *
-import sqlite3
+from serverless_otel.common import make_segment_identifier
+from serverless_otel.common.constants import *
+from serverless_otel.common.env_utils import str_as_bool
+from serverless_otel.common.errors import *
+
+from serverless_otel.filesystem_storage import determine_filesystem_path
+from serverless_otel.sqlite_storage import determine_sqlite_file_path
+
+from serverless_otel.s3_mutex import s3_lock_segment, s3_unlock_segment, s3_initialise_segment_locks
+from serverless_otel.nfs_mutex import nfs_lock_segment, nfs_unlock_segment, nfs_initialise_segment_locks
 
 
 def _create_csv_string(correlation_id: str, timestamp: str, value: str) -> str:
@@ -60,7 +66,8 @@ USE_COLUMNFILE_STORAGE: Final[bool] = str_as_bool(os.getenv('USE_COLUMNFILE_STOR
 STORAGE_BASE_PATH: Final[str] = os.getenv('SHARED_STORAGE_BASEDIR', '/mnt/otel-hot/segments')
 SEGMENT_BUCKET_SIZE_MINUTES: Final[int] = int(os.getenv('SEGMENT_BUCKET_SIZE_MINUTES', '15'))
 
-tracer = trace.get_tracer(__name__)
+tracer:Tracer = get_tracer(__name__)
+
 
 def lambda_handler(event: APIGatewayProxyEventV2, context: context_.Context):
     telemetry_dict: Dict[str, str] = _body_to_dict(event)
@@ -69,16 +76,16 @@ def lambda_handler(event: APIGatewayProxyEventV2, context: context_.Context):
     # this is a primitive mechanism to break the files down into smaller chunks by putting
     # them into separate directories that contain files of __SEGMENT_BUCKET_SIZE_MINUTES__
     # minutes worth of data
-    segment_id: str = _make_segment_identifier(int(telemetry_dict['timestamp-ns']))
+    segment_id: str = make_segment_identifier(int(telemetry_dict['timestamp-ns']))
 
     if USE_SQLITE_STORAGE:
-       return _lambda_handler_sqlite(event, context, dataset_id, segment_id, telemetry_dict)
+        return _lambda_handler_sqlite(event, context, dataset_id, segment_id, telemetry_dict)
 
     if USE_COLUMNFILE_STORAGE:
         return _lambda_handler_files(event, context, dataset_id, segment_id, telemetry_dict)
 
 
-def _lambda_handler_sqlite(event, context, dataset_id: str, segment_id: str, telemetry_dict: Dict[str,Any]):
+def _lambda_handler_sqlite(event, context, dataset_id: str, segment_id: str, telemetry_dict: Dict[str, Any]):
     nfs_initialise_segment_locks(STORAGE_BASE_PATH, dataset_id, INSTANCE_ID, segment_id)
 
     with tracer.start_as_current_span('lambda_handler_sqlite') as span:
@@ -101,7 +108,7 @@ def _lambda_handler_sqlite(event, context, dataset_id: str, segment_id: str, tel
             if USE_S3_MUTEX:
                 lock = s3_lock_segment(dataset_id, segment_id, INSTANCE_ID, UTC_NOW_NANOS)
 
-            data_file: str = os.path.join(STORAGE_BASE_PATH, dataset_id, segment_id, f'{segment_id}.sqlite')
+            data_file:str = determine_sqlite_file_path(STORAGE_BASE_PATH, dataset_id, segment_id)
             span.set_attribute('database_path', data_file)
 
             database_exists: bool = os.path.exists(data_file)
@@ -113,9 +120,10 @@ def _lambda_handler_sqlite(event, context, dataset_id: str, segment_id: str, tel
 
             if not database_exists:
                 span.add_event(f'created database')
-                con.execute('CREATE TABLE segment_data (correlation_id TEXT PRIMARY KEY, timestamp INTEGER, payload TEXT)')
+                con.execute(
+                    'CREATE TABLE segment_data (correlation_id TEXT PRIMARY KEY, timestamp INTEGER, payload TEXT)')
 
-            con.execute('INSERT INTO segment_data(timestamp, correlation_id, payload) VALUES (?, ?, ?)', (timestamp, correlation_id, json.dumps(telemetry_dict)))
+            con.execute('INSERT INTO segment_data(timestamp, correlation_id, payload) VALUES (?, ?, ?)',(timestamp, correlation_id, json.dumps(telemetry_dict)))
             con.commit()
 
             print(f'Wrote value to {data_file}.')
@@ -139,8 +147,9 @@ def _lambda_handler_sqlite(event, context, dataset_id: str, segment_id: str, tel
 
             con.close()
 
+
 # implementation of the lambda handler that uses files for storing
-def _lambda_handler_files(event, context, dataset_id: str, segment_id: str, telemetry_dict: Dict[str,Any]):
+def _lambda_handler_files(event, context, dataset_id: str, segment_id: str, telemetry_dict: Dict[str, Any]):
     timestamp: str = telemetry_dict['timestamp-ns']
     correlation_id: str = telemetry_dict['correlation-id']
 
@@ -191,21 +200,6 @@ def _lambda_handler_files(event, context, dataset_id: str, segment_id: str, tele
                 print(f'Could not unlock segment {segment_id} for instance {INSTANCE_ID}, {err}')
 
 
-def _make_segment_identifier(current_nanos: int):
-    # truncate the time to the correct multiple of __SEGMENT_BUCKET_SIZE_MINUTES__ as the identifier
-    whole: int = math.floor(current_nanos / (SEGMENT_BUCKET_SIZE_MINUTES * NS_PER_MIN))
-    return f'segment-{int(whole * (SEGMENT_BUCKET_SIZE_MINUTES * NS_PER_MIN))}'
-
-
-def _get_file_path_for_column(basedir: str, dataset_id: str, segment: str, key: str) -> str:
-    data_file: str = os.path.join(basedir, dataset_id, segment, f'{key}')
-
-    if not os.path.exists(data_file):
-        with open(data_file, mode='a'):
-            pass
-
-    return data_file
-
 
 def _body_to_dict(event: APIGatewayProxyEventV2) -> Dict[str, str]:
     body: str = event['body']
@@ -249,13 +243,10 @@ def _body_to_dict(event: APIGatewayProxyEventV2) -> Dict[str, str]:
 
 
 def _append_record(dataset_id: str, segment_id: str, timestamp: str, correlation_id: str, key: str, value: str):
-    path: str = _get_file_path_for_column(STORAGE_BASE_PATH, dataset_id, segment_id, key)
+    path: str = determine_filesystem_path(STORAGE_BASE_PATH, dataset_id, segment_id, key)
     line: str = FORMAT_SEGMENT_LINE(timestamp, correlation_id, value)
 
     with open(path, 'a') as column_file:
         # append the value to the column file
         column_file.write(f'{line}\n')
         column_file.flush()
-
-
-

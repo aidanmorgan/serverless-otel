@@ -1,0 +1,2 @@
+serverless_otel_common
+serverless_otel_metadata

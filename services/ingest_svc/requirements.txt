@@ -1,0 +1,11 @@
+serverless_otel.common
+serverless_otel.filesystem_storage
+serverless_otel.sqlite_storage
+serverless_otel.nfs_mutex
+serverless_otel.s3_mutex
+
+boto3
+botocore
+python-lru
+opentelemetry-api
+aws_lambda_typing
