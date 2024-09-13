@@ -9,6 +9,9 @@ from sqlite3 import Connection
 from typing import List, Dict, Optional, Any, Callable
 from uuid import uuid4
 
+from aws_lambda_typing.events import APIGatewayProxyEventV2
+import aws_lambda_typing.context as context_
+
 from opentelemetry.trace import Tracer, get_tracer
 
 from serverless_otel.common import make_segment_identifier

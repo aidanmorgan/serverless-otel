@@ -1,3 +1,3 @@
 python-lru
-opentelemetry-api
 aws_lambda_typing
+opentelemetry-api
